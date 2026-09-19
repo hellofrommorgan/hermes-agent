@@ -850,6 +850,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     from agent import relay_llm
     transport_errors = (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ReadError, _httpx.ConnectError, ConnectionError)
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
+    # Only main-turn request clients participate; auxiliary/direct compaction calls do not.
+    body_recovery = getattr(agent, "_copilot_body_read_recovery", None) if client is not None else None
     max_stream_retries, model = 1, api_kwargs.get("model")
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
@@ -908,7 +910,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
         stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
         stream_kwargs["stream"] = True
-        return active_client.responses.create(**bypass_sdk_request_transform(stream_kwargs))
+        def send(kwargs):
+            return active_client.responses.create(**bypass_sdk_request_transform(kwargs))
+        if body_recovery is not None:
+            return body_recovery.open_stream(agent, stream_kwargs, send)
+        return send(stream_kwargs)
 
     def _log_failure(exc: BaseException) -> None:
         request_body_bytes, exception_chain = _codex_request_failure_details(exc)
@@ -990,6 +996,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     on_event=_fenced(_on_event), interrupt_check=_interrupt_or_superseded,
                 )
             except transport_errors as exc:
+                if body_recovery is not None and body_recovery.retry_in_flight:
+                    raise
                 if attempt >= max_stream_retries:
                     _log_failure(exc)
                     raise
@@ -1000,6 +1008,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 )
                 continue
             except RuntimeError:
+                if body_recovery is not None and body_recovery.retry_in_flight:
+                    raise
                 # "No terminal response"; Relay may still hold a finalizer-assembled response.
                 if event_stream is not None and event_stream.final_response is not None:
                     return event_stream.final_response
@@ -1014,7 +1024,17 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                                "(incomplete_details=%s, error=%s, streamed_chars=%d). %s",
                                final.status, final.incomplete_details, final.error,
                                sum(len(p) for p in agent._codex_streamed_text_parts), agent._client_log_context())
+            if body_recovery is not None and body_recovery.retry_in_flight:
+                from agent.copilot_body_read_recovery import CopilotBodyReadStopped
+                if final.status != "completed" or not final.output:
+                    raise CopilotBodyReadStopped("The reduced response did not complete successfully.")
+                body_recovery.retry_in_flight = False
             return final
+        except Exception as exc:
+            if body_recovery is not None and body_recovery.retry_in_flight:
+                from agent.copilot_body_read_recovery import CopilotBodyReadStopped
+                raise CopilotBodyReadStopped("The reduced request also failed; it was not retried again.") from exc
+            raise
         finally:
             _close_event_stream(event_stream)
 

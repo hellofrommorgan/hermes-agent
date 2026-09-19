@@ -77,6 +77,21 @@ def handle_api_error(
     if agent.thinking_callback:
         agent.thinking_callback("")
 
+    from agent.copilot_body_read_recovery import CopilotBodyReadStopped
+    if isinstance(api_error, CopilotBodyReadStopped):
+        guidance = (
+            f"Copilot timed out reading the request body. {api_error} "
+            "The full session transcript is preserved. Start a fresh session with a focused "
+            "request, or reduce tool output using file pagination/filters before trying again. "
+            "No model compaction was attempted for this error."
+        )
+        agent._persist_session(messages, conversation_history)
+        return _verdict("return", {
+            "final_response": guidance, "messages": messages, "api_calls": api_call_count,
+            "completed": False, "failed": True, "error": guidance,
+            "failure_reason": "copilot_request_body_timeout", "failure_retryable": False,
+        })
+
     _recovered, active_system_prompt = recover_before_classification(
         agent, api_error, messages=messages, api_messages=api_messages, api_kwargs=api_kwargs,
         active_system_prompt=active_system_prompt,

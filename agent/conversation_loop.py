@@ -1457,6 +1457,8 @@ def _run_conversation_turn(
     agent._last_compaction_in_place = agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
     begin_fast_mode_turn(agent, conversation_history)
+    from agent.copilot_body_read_recovery import CopilotBodyReadRecovery
+    agent._copilot_body_read_recovery = CopilotBodyReadRecovery()
 
     # Adopt ~/.hermes/.env credential/base-url edits made since the last turn — a
     # Settings save updates .env, not this worker's client (#67821). No-op if unchanged.
