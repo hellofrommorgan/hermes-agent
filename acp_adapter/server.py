@@ -20,7 +20,7 @@ from acp.schema import (
     Implementation, InitializeResponse, ListSessionsResponse, LoadSessionResponse, McpServerHttp, McpServerSse,
     McpServerStdio, ModelInfo, NewSessionResponse, PromptCapabilities, PromptResponse, ResumeSessionResponse,
     SessionCapabilities, SessionForkCapabilities, SessionInfo, SessionInfoUpdate, SessionListCapabilities,
-    SessionMode, SessionModeState, SessionModelState, SessionResumeCapabilities, SetSessionConfigOptionResponse,
+    SessionMode, SessionModeState, SessionModelState, SessionConfigOptionSelect, SessionConfigOptionBoolean, SessionConfigSelectOption, SessionResumeCapabilities, SetSessionConfigOptionResponse,
     SetSessionModeResponse, SetSessionModelResponse, TextContentBlock, Usage, UsageUpdate, UserMessageChunk,
 )
 
@@ -303,6 +303,17 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         try:
             picker = build_model_state(model, provider, str(getattr(state.agent, "base_url", "") or ""))
             if picker is not None:
+                only_provider = os.environ.get("HERMES_ACP_PROVIDER_ONLY", "").strip().lower()
+                if only_provider:
+                    choices = [item for item in picker.available_models
+                               if item.model_id.startswith(f"{only_provider}:")]
+                    if choices:
+                        current = picker.current_model_id
+                        return SessionModelState(
+                            available_models=choices,
+                            current_model_id=current if current in {item.model_id for item in choices}
+                            else choices[0].model_id,
+                        )
                 return picker
         except Exception:
             logger.debug("Could not build ACP model state", exc_info=True)
@@ -576,8 +587,19 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             if not await self._send(state.session_id, update, fail_msg="Failed to replay ACP history for session %s"):
                 return
 
+    @staticmethod
+    def _model_config_options(models: SessionModelState | None) -> list[SessionConfigOptionSelect | SessionConfigOptionBoolean]:
+        if not models or not models.available_models:
+            return []
+        return [SessionConfigOptionSelect(
+            id="model", name="Model", category="model", type="select",
+            current_value=models.current_model_id,
+            options=[SessionConfigSelectOption(value=item.model_id, name=item.name)
+                     for item in models.available_models],
+        )]
+
     async def _session_response_fields(self, state: SessionState, replay_verb: str | None = None) -> dict[str, Any]:
-        """``models``/``modes``/``field_meta`` for session responses, after an optional history replay;
+        """``models``/``config_options``/``modes`` for session responses, after optional replay;
         schedules command advertisement + usage refresh.
 
         Per ACP spec, load/resume must stream history via ``session/update`` BEFORE responding
@@ -602,8 +624,10 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 )
         self._schedule_available_commands_update(state.session_id)
         self._schedule_soon(lambda: self._send_usage_update(state))
+        models = self._build_model_state(state)
         return {
-            "models": self._build_model_state(state),
+            "models": models,
+            "config_options": self._model_config_options(models),
             "modes": self._session_modes(state),
             "field_meta": self._provenance_meta(state.session_id, getattr(state.agent, "session_id", state.session_id)),
         }
@@ -673,8 +697,10 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         await self._register_session_mcp_servers(state, mcp_servers)
         logger.info("Forked session %s -> %s", session_id, state.session_id)
         self._schedule_available_commands_update(state.session_id)
+        models = self._build_model_state(state)
         return ForkSessionResponse(
-            session_id=state.session_id, models=self._build_model_state(state), modes=self._session_modes(state)
+            session_id=state.session_id, models=models,
+            config_options=self._model_config_options(models), modes=self._session_modes(state)
         )
 
     async def list_sessions(
@@ -1025,6 +1051,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         if state is None:
             logger.warning("Session %s: model switch requested for missing session", session_id)
             return None
+        only_provider = os.environ.get("HERMES_ACP_PROVIDER_ONLY", "").strip().lower()
+        if only_provider and not model_id.startswith(f"{only_provider}:"):
+            raise acp.RequestError(-32602, "Model is outside this ACP provider")
         # The picker swaps state.agent wholesale; mid-turn that strands the running agent and
         # makes _finish_turn emit a spurious compression-rotation update. Same exclusion as
         # the /model slash command.
@@ -1082,6 +1111,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
         if str(config_id) == self._EDIT_APPROVAL_POLICY_CONFIG_ID:
             state.mode = self._EDIT_APPROVAL_POLICY_TO_MODE.get(str(value), self._MODE_DEFAULT)
+        elif str(config_id) == "model":
+            await self.set_session_model(model_id=str(value), session_id=session_id)
+            return SetSessionConfigOptionResponse(config_options=self._model_config_options(self._build_model_state(state)))
         else:
             options = getattr(state, "config_options", None)
             if not isinstance(options, dict):

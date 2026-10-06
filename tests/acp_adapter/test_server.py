@@ -44,10 +44,11 @@ def agent(mock_manager):
 
 
 @pytest.mark.asyncio
-async def test_new_session_exposes_edit_approvals_as_modes_not_config_options(agent):
+async def test_new_session_exposes_model_config_and_edit_approval_modes(agent):
     resp = await agent.new_session(cwd="/tmp")
 
-    assert resp.config_options is None
+    assert len(resp.config_options or []) == 1
+    assert resp.config_options[0].category == "model"
     assert isinstance(resp.modes, SessionModeState)
     assert resp.modes.current_mode_id == "default"
     assert [mode.id for mode in resp.modes.available_modes] == [
